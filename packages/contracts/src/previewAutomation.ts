@@ -767,11 +767,25 @@ export class PreviewAutomationTimeoutError extends Schema.TaggedError<PreviewAut
     ...PreviewAutomationRequestErrorFields,
     ...PreviewAutomationOptionalRemoteDiagnosticFields,
     reason: Schema.optional(Schema.String),
+    timeoutSource: Schema.optional(Schema.Literals(["host-response", "browser-operation"])),
+    traceId: Schema.optional(TrimmedNonEmptyString),
+    spanId: Schema.optional(TrimmedNonEmptyString),
   },
 ) {
   override get message(): string {
     const summary = `Preview automation ${this.operation} timed out after ${this.timeoutMs}ms.`;
-    return this.reason === undefined ? summary : `${summary} ${this.reason}`;
+    const source =
+      this.timeoutSource === "host-response"
+        ? " The request was queued, but the automation host did not respond."
+        : this.timeoutSource === "browser-operation"
+          ? " The automation host reported a browser operation timeout."
+          : "";
+    const reason = this.reason === undefined ? "" : ` ${this.reason}`;
+    const correlation =
+      this.traceId !== undefined && this.spanId !== undefined
+        ? ` Trace ${this.traceId}, span ${this.spanId}.`
+        : "";
+    return `${summary}${source}${reason}${correlation}`;
   }
 }
 

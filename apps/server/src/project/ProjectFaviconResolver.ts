@@ -97,11 +97,6 @@ export class ProjectFaviconResolutionError extends Schema.TaggedError<ProjectFav
   }
 }
 
-const isWorkspaceRootNotExistsError = Schema.is(WorkspacePaths.WorkspaceRootNotExistsError);
-
-export const isMissingWorkspaceRoot = (error: ProjectFaviconResolutionError): boolean =>
-  error.operation === "normalize-workspace" && isWorkspaceRootNotExistsError(error.cause);
-
 export class ProjectFaviconResolver extends Context.Service<
   ProjectFaviconResolver,
   {
@@ -254,6 +249,7 @@ export const make = Effect.gen(function* () {
     faviconPath?: string,
   ): Effect.fn.Return<string | null, ProjectFaviconResolutionError> {
     const projectCwd = yield* workspacePaths.normalizeWorkspaceRoot(cwd).pipe(
+      Effect.catchTags({ WorkspaceRootNotExistsError: () => Effect.succeed(null) }),
       Effect.mapError(
         (cause) =>
           new ProjectFaviconResolutionError({
@@ -263,6 +259,7 @@ export const make = Effect.gen(function* () {
           }),
       ),
     );
+    if (projectCwd === null) return null;
     if (faviconPath !== undefined) {
       const existing = yield* findExistingFile(projectCwd, [faviconPath], "filesystem");
       if (existing) {

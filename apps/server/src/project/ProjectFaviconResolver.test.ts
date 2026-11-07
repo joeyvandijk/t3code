@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import { TestClock } from "effect/testing";
 
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
@@ -43,12 +44,69 @@ const writeTextFile = Effect.fn("writeTextFile")(function* (
 
 const makeResolverWithFileSystem = (fileSystem: FileSystem.FileSystem) =>
   ProjectFaviconResolver.make.pipe(
-    Effect.provide([WorkspacePaths.layer, T3ProjectFileLoader.layer]),
+    Effect.provide([Layer.fresh(WorkspacePaths.layer), Layer.fresh(T3ProjectFileLoader.layer)]),
     Effect.provideService(FileSystem.FileSystem, fileSystem),
   );
 
 it.layer(layerTest)("ProjectFaviconResolverLive", (it) => {
   describe("resolvePath", () => {
+    it.effect("caches a missing workspace as no favicon and retries after the miss expires", () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const cwd = path.join(yield* makeTempDir, "not-created-yet");
+        let rootChecks = 0;
+        const resolver = yield* makeResolverWithFileSystem(
+          FileSystem.FileSystem.of({
+            ...fileSystem,
+            stat: (filePath) => {
+              if (filePath === cwd) rootChecks++;
+              return fileSystem.stat(filePath);
+            },
+          }),
+        );
+
+        expect(yield* resolver.resolvePath(cwd)).toBeNull();
+        expect(yield* resolver.resolvePath(cwd)).toBeNull();
+        expect(rootChecks).toBe(1);
+
+        yield* writeTextFile(cwd, "favicon.svg", "<svg>restored</svg>");
+        expect(yield* resolver.resolvePath(cwd)).toBeNull();
+        yield* TestClock.adjust("1 minute");
+        expect(yield* resolver.resolvePath(cwd)).toBe(path.join(cwd, "favicon.svg"));
+        expect(rootChecks).toBe(2);
+      }),
+    );
+
+    it.effect(
+      "preserves workspace permission errors instead of caching them as a favicon miss",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const cwd = yield* makeTempDir;
+          const denied = PlatformError.systemError({
+            _tag: "PermissionDenied",
+            module: "FileSystem",
+            method: "stat",
+            pathOrDescriptor: cwd,
+          });
+          const resolver = yield* makeResolverWithFileSystem(
+            FileSystem.FileSystem.of({
+              ...fileSystem,
+              stat: (filePath) =>
+                filePath === cwd ? Effect.fail(denied) : fileSystem.stat(filePath),
+            }),
+          );
+
+          const error = yield* resolver.resolvePath(cwd).pipe(Effect.flip);
+          expect(error).toMatchObject({
+            _tag: "ProjectFaviconResolutionError",
+            operation: "normalize-workspace",
+            cause: { _tag: "WorkspaceRootStatFailedError", cause: denied },
+          });
+        }),
+    );
+
     it.effect("finds a favicon added after a cached miss once the workspace is invalidated", () =>
       Effect.gen(function* () {
         const resolver = yield* ProjectFaviconResolver.ProjectFaviconResolver;

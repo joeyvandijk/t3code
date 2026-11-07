@@ -6,6 +6,7 @@ import {
   PreviewAutomationHost,
   PreviewAutomationInvalidSelectorError,
   PreviewAutomationStatus,
+  PreviewAutomationTimeoutError,
 } from "./previewAutomation.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
@@ -81,5 +82,33 @@ describe("PreviewAutomationInvalidSelectorError", () => {
     expect(message).toMatch(/CSS/);
     expect(message).toMatch(/\blocator\b/);
     expect(message).toContain("aria-ref=");
+  });
+});
+
+describe("PreviewAutomationTimeoutError", () => {
+  it("accepts legacy errors and preserves timeout diagnostics through the wire schema", () => {
+    const decode = Schema.decodeUnknownSync(PreviewAutomationTimeoutError);
+    const encode = Schema.encodeSync(PreviewAutomationTimeoutError);
+    const legacy = decode({
+      _tag: "PreviewAutomationTimeoutError",
+      operation: "snapshot",
+      environmentId: "environment-1",
+      threadId: "thread-1",
+      providerSessionId: "session-1",
+      providerInstanceId: "codex",
+      clientId: "desktop",
+      connectionId: "connection-1",
+      requestId: "request-1",
+      timeoutMs: 15_000,
+    });
+    expect(legacy.message).toBe("Preview automation snapshot timed out after 15000ms.");
+
+    const diagnostics = {
+      timeoutSource: "host-response",
+      traceId: "0123456789abcdef0123456789abcdef",
+      spanId: "0123456789abcdef",
+    };
+    const current = decode({ ...encode(legacy), ...diagnostics });
+    expect(decode(encode(current))).toMatchObject(diagnostics);
   });
 });
