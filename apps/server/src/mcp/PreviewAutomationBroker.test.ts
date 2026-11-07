@@ -20,6 +20,8 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
+import * as Tracer from "effect/Tracer";
 
 import { PreviewBrowserRootError } from "../preview/PreviewBrowserHost.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
@@ -335,7 +337,7 @@ it.effect.each([
   ),
 );
 
-it.effect("names the click target that matched nothing when the server browser times out", () =>
+it.effect("identifies browser-reported timeouts and preserves the click target guidance", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const broker = yield* makeBroker;
@@ -365,9 +367,75 @@ it.effect("names the click target that matched nothing when the server browser t
         .pipe(Effect.flip);
 
       expect(error._tag).toBe("PreviewAutomationTimeoutError");
-      expect(error.message).toBe(
-        'Preview automation click timed out after 15000ms. No element matches ".definitely-no-such-t3-target".',
+      expect(error).toMatchObject({ timeoutSource: "browser-operation" });
+      expect(error.message).toContain("The automation host reported a browser operation timeout.");
+      expect(error.message).toContain('No element matches ".definitely-no-such-t3-target".');
+    }),
+  ),
+);
+
+it.effect("correlates an unanswered request without exposing its input", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const broker = yield* makeBroker;
+      const ready = yield* Deferred.make<void>();
+      const delivered = yield* Deferred.make<RoutedRequest>();
+      const events = (yield* broker.connect(makeHost())).pipe(
+        Stream.tap((event) =>
+          event.type === "connected" ? Deferred.succeed(ready, undefined) : Effect.void,
+        ),
       );
+      yield* Stream.runForEach(requestsFrom(events), (request) =>
+        Deferred.succeed(delivered, request),
+      ).pipe(Effect.forkScoped);
+      yield* Deferred.await(ready);
+
+      const ended: Tracer.NativeSpan[] = [];
+      const tracer = Tracer.make({
+        span(options) {
+          const span = new Tracer.NativeSpan(options);
+          const end = span.end.bind(span);
+          span.end = (endTime, exit) => {
+            end(endTime, exit);
+            ended.push(span);
+          };
+          return span;
+        },
+      });
+      const request = yield* broker
+        .invoke<void>({
+          scope,
+          operation: "type",
+          tabId: PreviewTabId.make("tab-timeout"),
+          input: { selector: "#private-field", text: "secret-value" },
+          timeoutMs: 1_000,
+        })
+        .pipe(Effect.withTracer(tracer), Effect.flip, Effect.forkScoped);
+      const queued = yield* Deferred.await(delivered);
+      yield* TestClock.adjust("2 seconds");
+      const error = yield* Fiber.join(request);
+      const span = ended.find((entry) => entry.name === "PreviewAutomationBroker.invoke");
+
+      expect(error).toMatchObject({
+        _tag: "PreviewAutomationTimeoutError",
+        timeoutSource: "host-response",
+        requestId: queued.requestId,
+        connectionId: queued.connectionId,
+        traceId: span?.traceId,
+        spanId: span?.spanId,
+      });
+      expect(error.message).toContain(
+        "The request was queued, but the automation host did not respond.",
+      );
+      expect(error.message).toContain(`Trace ${span?.traceId}, span ${span?.spanId}`);
+      expect(span?.attributes.get("preview.stage")).toBe("awaiting-response");
+      expect(span?.attributes.get("preview.request_id")).toBe(queued.requestId);
+      expect(span?.attributes.get("preview.tab_id")).toBe("tab-timeout");
+      expect(span?.attributes.get("preview.selector_kind")).toBe("selector");
+      expect(span?.attributes.get("preview.selector_length")).toBe(14);
+      expect(JSON.stringify([...span!.attributes])).not.toContain("private-field");
+      expect(JSON.stringify([...span!.attributes])).not.toContain("secret-value");
+      expect(error.message).not.toContain("secret-value");
     }),
   ),
 );

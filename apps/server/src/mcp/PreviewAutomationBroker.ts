@@ -38,6 +38,7 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
+import type * as Tracer from "effect/Tracer";
 
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 
@@ -91,6 +92,7 @@ interface PendingRequest {
   readonly queue: ClientConnection["queue"];
   readonly deferred: Deferred.Deferred<unknown, PreviewAutomationError>;
   readonly context: PreviewAutomationRequestErrorContext;
+  readonly span?: Tracer.Span;
 }
 
 /** A lease belongs to this exact connectionId/queue; replacing the host invalidates it. */
@@ -115,6 +117,8 @@ interface PreviewAutomationRequestErrorContext {
   readonly timeoutMs: number;
   readonly selectorKind?: "locator" | "selector";
   readonly selectorLength?: number;
+  readonly traceId?: string;
+  readonly spanId?: string;
 }
 
 interface BrokerState {
@@ -267,6 +271,7 @@ const classifyResponseError = (
       return new PreviewAutomationTimeoutError({
         ...context,
         ...remoteDiagnostics,
+        timeoutSource: "browser-operation",
         ...(context.clientId === SERVER_BROWSER_AUTOMATION_CLIENT_ID && remoteReason !== undefined
           ? { reason: remoteReason.slice(0, MAX_REASON_CHARS) }
           : {}),
@@ -501,6 +506,7 @@ export const make = Effect.gen(function* PreviewAutomationBrokerMake() {
       return [entry, { ...current, pending: next }] as const;
     });
     if (!pending) return;
+    pending.span?.attribute("preview.stage", "response-received");
     if (response.ok) {
       yield* Deferred.succeed(pending.deferred, response.result);
     } else {
@@ -516,6 +522,13 @@ export const make = Effect.gen(function* PreviewAutomationBrokerMake() {
   const invoke = Effect.fn("PreviewAutomationBroker.invoke")(function* <A = unknown>(
     input: Parameters<PreviewAutomationBroker["Service"]["invoke"]>[0],
   ): Effect.fn.Return<A, PreviewAutomationError> {
+    const span = yield* Effect.currentSpan.pipe(Effect.orElseSucceed(() => undefined));
+    yield* Effect.annotateCurrentSpan({
+      "preview.operation": input.operation,
+      "preview.environment_id": input.scope.environmentId,
+      "preview.thread_id": input.scope.thread.threadId,
+      "preview.stage": "routing",
+    });
     const deferred = yield* Deferred.make<unknown, PreviewAutomationError>();
     const route = yield* SynchronizedRef.modify(state, (current) => {
       const assignments = new Map(
@@ -597,9 +610,15 @@ export const make = Effect.gen(function* PreviewAutomationBrokerMake() {
         ...(tabId === undefined ? {} : { tabId }),
         timeoutMs,
         ...selectorDiagnostics,
+        ...(span === undefined ? {} : { traceId: span.traceId, spanId: span.spanId }),
       };
       const pending = new Map(current.pending);
-      pending.set(requestId, { queue: connection.queue, deferred, context });
+      pending.set(requestId, {
+        queue: connection.queue,
+        deferred,
+        context,
+        ...(span === undefined ? {} : { span }),
+      });
       return [
         { connection, requestId, requestContext: context, requestSequence },
         { ...current, assignments, pending, requestSequence: current.requestSequence + 1 },
@@ -616,6 +635,19 @@ export const make = Effect.gen(function* PreviewAutomationBrokerMake() {
     }
     const { connection, requestId, requestContext, requestSequence } = route;
     const { timeoutMs } = requestContext;
+    yield* Effect.annotateCurrentSpan({
+      "preview.request_id": requestId,
+      "preview.client_id": connection.clientId,
+      "preview.connection_id": connection.connectionId,
+      "preview.timeout_ms": timeoutMs,
+      ...(requestContext.tabId === undefined ? {} : { "preview.tab_id": requestContext.tabId }),
+      ...(requestContext.selectorKind === undefined
+        ? {}
+        : {
+            "preview.selector_kind": requestContext.selectorKind,
+            "preview.selector_length": requestContext.selectorLength,
+          }),
+    });
     input.onTargetTab?.(requestContext.tabId);
     const removePending = SynchronizedRef.update(state, (next) => {
       if (!next.pending.has(requestId)) return next;
@@ -654,6 +686,7 @@ export const make = Effect.gen(function* PreviewAutomationBrokerMake() {
         }
         return yield* new PreviewAutomationRequestQueueClosedError(requestContext);
       }
+      span?.attribute("preview.stage", "awaiting-response");
       // The browser timer starts on delivery; allow its timeout response before evicting the host.
       const responseTimeoutMs =
         input.updateCurrentTab === false ? timeoutMs : timeoutMs + HOST_RESPONSE_GRACE_MS;
@@ -665,12 +698,20 @@ export const make = Effect.gen(function* PreviewAutomationBrokerMake() {
           if (input.updateCurrentTab !== false) {
             yield* disconnect(connection.clientId, connection.queue, true);
           }
-          return yield* new PreviewAutomationTimeoutError(requestContext);
+          return yield* new PreviewAutomationTimeoutError({
+            ...requestContext,
+            timeoutSource: "host-response",
+          });
         }),
         onSome: (value) => Effect.succeed(value as A),
       });
     });
-    const result = yield* awaitResponse().pipe(Effect.ensuring(removePending));
+    const result = yield* awaitResponse().pipe(
+      Effect.tapError((error) =>
+        Effect.sync(() => span?.attribute("preview.error_tag", error._tag)),
+      ),
+      Effect.ensuring(removePending),
+    );
     if (input.updateCurrentTab === false) return result;
     const responseTabId = readResultTabId(result);
     const resultTabId = responseTabId === undefined ? input.tabId : responseTabId;
